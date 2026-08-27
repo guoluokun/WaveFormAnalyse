@@ -5,15 +5,13 @@ from __future__ import annotations
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from ..params import (
-    AnalysisParams, BaselineParams, DerivParams, FilterParams,
+    AnalysisParams, BaselineParams, DerivParams, FilterParams, FitParams,
     PeakParams, SmoothParams, SpectrumParams, ThresholdParams,
 )
 
 BASELINE_METHODS = [
-    ("前置采样均值", "pre"),
-    ("全局中位数", "median"),
-    ("迭代 sigma 裁剪", "sigma_clip"),
-    ("移动中位数跟踪", "moving"),
+    ("前置采样均值", "pre"), ("全局中位数", "median"),
+    ("迭代 sigma 裁剪", "sigma_clip"), ("移动中位数跟踪", "moving"),
 ]
 THRESHOLD_MODES = [("n × sigma", "sigma"), ("绝对 ADC 值", "abs")]
 FILTER_KINDS = [
@@ -22,19 +20,15 @@ FILTER_KINDS = [
 ]
 SMOOTH_METHODS = [("不平滑", "none"), ("滑动平均", "movavg"), ("Savitzky-Golay", "savgol")]
 DERIV_METHODS = [("中心差分", "central"), ("Savitzky-Golay", "savgol"), ("前向差分", "forward")]
-PEAK_SOURCES = [("信号波形极大值", "signal"), ("导数过零点", "zero_cross"),
-                ("导数上升沿", "derivative")]
+PEAK_SOURCES = [("信号波形极大值", "signal"), ("导数过零点", "zero_cross"), ("导数上升沿", "derivative")]
+FIT_MODELS = [("Gaussian", "gaussian"), ("指数衰减", "exponential"), ("双指数脉冲", "double_exp")]
+FIT_SOURCES = [("基线校正信号", "signal"), ("平滑后信号", "smoothed")]
 FFT_WINDOWS = [("Hann", "hann"), ("Hamming", "hamming"), ("Blackman", "blackman"), ("矩形窗", "boxcar")]
 POLARITIES = [("正脉冲", 1), ("负脉冲", -1)]
 
 
 class _NoWheelMixin:
-    """屏蔽滚轮改值：鼠标经过控件滚动时只滚动面板，避免误触。
-
-    参数只能通过点击箭头、键盘或双击输入修改。
-    """
-
-    def wheelEvent(self, event):  # noqa: N802 - Qt 命名
+    def wheelEvent(self, event):  # noqa: N802
         event.ignore()
 
 
@@ -77,6 +71,21 @@ def _dspin(lo, hi, val, step=0.1, decimals=3) -> QtWidgets.QDoubleSpinBox:
     return s
 
 
+def _set_silent(widget, value):
+    old = widget.blockSignals(True)
+    try:
+        if isinstance(widget, QtWidgets.QComboBox):
+            idx = widget.findData(value)
+            if idx >= 0:
+                widget.setCurrentIndex(idx)
+        elif isinstance(widget, QtWidgets.QCheckBox):
+            widget.setChecked(bool(value))
+        else:
+            widget.setValue(value)
+    finally:
+        widget.blockSignals(old)
+
+
 class ControlPanel(QtWidgets.QWidget):
     """参数面板。任何控件变化都会发出 changed 信号。"""
 
@@ -100,6 +109,7 @@ class ControlPanel(QtWidgets.QWidget):
         self._build_filter()
         self._build_smooth_deriv()
         self._build_peaks()
+        self._build_fit()
         self._build_spectrum()
         self._v.addStretch(1)
 
@@ -108,7 +118,6 @@ class ControlPanel(QtWidgets.QWidget):
         self.changed.connect(self._sync_enabled)
         self._sync_enabled()
 
-    # ---------------- 构建各分组 ----------------
     def _group(self, title: str) -> QtWidgets.QFormLayout:
         box = QtWidgets.QGroupBox(title)
         form = QtWidgets.QFormLayout(box)
@@ -185,8 +194,23 @@ class ControlPanel(QtWidgets.QWidget):
         form.addRow("最小宽度 (ns)", self.pk_width)
         form.addRow("积分门-峰前 (ns)", self.pk_gate_pre)
         form.addRow("积分门-峰后 (ns)", self.pk_gate_post)
-        hint = QtWidgets.QLabel("积分门为 0 时按脉冲边界自动积分（长尾脉冲会被截断，"
-                               "测电荷建议设固定门宽）")
+        hint = QtWidgets.QLabel("积分门为 0 时按脉冲边界自动积分；测量长尾波形电荷时建议设置固定门宽。")
+        hint.setWordWrap(True)
+        form.addRow("", hint)
+
+    def _build_fit(self):
+        form = self._group("波形拟合")
+        self.fit_enabled = QtWidgets.QCheckBox("启用拟合")
+        self.fit_model = _combo(FIT_MODELS)
+        self.fit_source = _combo(FIT_SOURCES)
+        self.fit_xmin = _dspin(-1e9, 1e9, 0.0, 1.0, 4)
+        self.fit_xmax = _dspin(-1e9, 1e9, 0.0, 1.0, 4)
+        form.addRow("", self.fit_enabled)
+        form.addRow("模型", self.fit_model)
+        form.addRow("输入", self.fit_source)
+        form.addRow("起始时间 (ns)", self.fit_xmin)
+        form.addRow("结束时间 (ns)", self.fit_xmax)
+        hint = QtWidgets.QLabel("起始和结束都为 0 时自动拟合整条波形；建议缩小区间以研究单个脉冲。")
         hint.setWordWrap(True)
         form.addRow("", hint)
 
@@ -211,21 +235,19 @@ class ControlPanel(QtWidgets.QWidget):
             w.toggled.connect(self.changed)
 
     def _set_tooltips(self):
-        self.bl_npre.setToolTip("仅「前置采样均值」使用")
-        self.bl_clip_k.setToolTip("仅「迭代 sigma 裁剪」使用")
-        self.bl_iter.setToolTip("仅「迭代 sigma 裁剪」使用")
-        self.bl_window.setToolTip("仅「移动中位数跟踪」使用")
-        self.th_nsigma.setToolTip("仅「n × sigma」模式使用")
-        self.th_abs.setToolTip("仅「绝对 ADC 值」模式使用")
+        self.bl_npre.setToolTip("仅『前置采样均值』使用")
+        self.bl_clip_k.setToolTip("仅『迭代 sigma 裁剪』使用")
+        self.bl_iter.setToolTip("仅『迭代 sigma 裁剪』使用")
+        self.bl_window.setToolTip("仅『移动中位数跟踪』使用")
+        self.th_nsigma.setToolTip("仅『n × sigma』模式使用")
+        self.th_abs.setToolTip("仅『绝对 ADC 值』模式使用")
         self.sm_poly.setToolTip("仅 Savitzky-Golay 平滑使用")
-        self.dv_window.setToolTip("仅 Savitzky-Golay 求导使用；中心差分/前向差分没有窗口参数")
+        self.dv_window.setToolTip("仅 Savitzky-Golay 求导使用")
         self.dv_poly.setToolTip("仅 Savitzky-Golay 求导使用")
-        self.pk_prom.setToolTip("仅「信号波形极大值」模式使用")
-        self.pk_width.setToolTip("仅「信号波形极大值」模式使用")
-        self.dv_method.setToolTip("只影响「导数」页签与导数类寻峰；波形页签的两张图不受影响")
+        self.pk_prom.setToolTip("仅『信号波形极大值』模式使用")
+        self.pk_width.setToolTip("仅『信号波形极大值』模式使用")
 
     def _sync_enabled(self):
-        """按当前选择把用不到的参数置灰，避免调了没反应。"""
         bl = self.bl_method.currentData()
         self.bl_npre.setEnabled(bl == "pre")
         self.bl_clip_k.setEnabled(bl == "sigma_clip")
@@ -253,50 +275,40 @@ class ControlPanel(QtWidgets.QWidget):
         self.pk_prom.setEnabled(src == "signal")
         self.pk_width.setEnabled(src == "signal")
 
-    # ---------------- 取参数 ----------------
+        enabled = self.fit_enabled.isChecked()
+        for w in (self.fit_model, self.fit_source, self.fit_xmin, self.fit_xmax):
+            w.setEnabled(enabled)
+
     def params(self) -> AnalysisParams:
         return AnalysisParams(
             polarity=self.polarity.currentData(),
-            baseline=BaselineParams(
-                method=self.bl_method.currentData(),
-                n_pre=self.bl_npre.value(),
-                clip_k=self.bl_clip_k.value(),
-                n_iter=self.bl_iter.value(),
-                window=self.bl_window.value(),
-            ),
-            threshold=ThresholdParams(
-                mode=self.th_mode.currentData(),
-                n_sigma=self.th_nsigma.value(),
-                abs_adc=self.th_abs.value(),
-            ),
-            filt=FilterParams(
-                kind=self.f_kind.currentData(),
-                f_low=self.f_low.value(),
-                f_high=self.f_high.value(),
-                order=self.f_order.value(),
-            ),
-            smooth=SmoothParams(
-                method=self.sm_method.currentData(),
-                window=self.sm_window.value(),
-                poly=self.sm_poly.value(),
-            ),
-            deriv=DerivParams(
-                method=self.dv_method.currentData(),
-                window=self.dv_window.value(),
-                poly=self.dv_poly.value(),
-                order=self.dv_order.value(),
-            ),
-            peaks=PeakParams(
-                source=self.pk_source.currentData(),
-                distance_ns=self.pk_distance.value(),
-                prominence_sigma=self.pk_prom.value(),
-                min_width_ns=self.pk_width.value(),
-                gate_pre_ns=self.pk_gate_pre.value(),
-                gate_post_ns=self.pk_gate_post.value(),
-            ),
-            spectrum=SpectrumParams(
-                window=self.sp_window.currentData(),
-                nperseg=self.sp_nperseg.value(),
-                log_y=self.sp_logy.isChecked(),
-            ),
+            baseline=BaselineParams(self.bl_method.currentData(), self.bl_npre.value(), self.bl_clip_k.value(), self.bl_iter.value(), self.bl_window.value()),
+            threshold=ThresholdParams(self.th_mode.currentData(), self.th_nsigma.value(), self.th_abs.value()),
+            filt=FilterParams(self.f_kind.currentData(), self.f_low.value(), self.f_high.value(), self.f_order.value()),
+            smooth=SmoothParams(self.sm_method.currentData(), self.sm_window.value(), self.sm_poly.value()),
+            deriv=DerivParams(self.dv_method.currentData(), self.dv_window.value(), self.dv_poly.value(), self.dv_order.value()),
+            peaks=PeakParams(self.pk_source.currentData(), self.pk_distance.value(), self.pk_prom.value(), self.pk_width.value(), self.pk_gate_pre.value(), self.pk_gate_post.value()),
+            fit=FitParams(self.fit_enabled.isChecked(), self.fit_model.currentData(), self.fit_source.currentData(), self.fit_xmin.value(), self.fit_xmax.value()),
+            spectrum=SpectrumParams(self.sp_window.currentData(), self.sp_nperseg.value(), self.sp_logy.isChecked()),
         )
+
+    def set_params(self, p: AnalysisParams) -> None:
+        """把参数对象恢复到界面；只在最后触发一次重新分析。"""
+        pairs = [
+            (self.polarity, p.polarity),
+            (self.bl_method, p.baseline.method), (self.bl_npre, p.baseline.n_pre),
+            (self.bl_clip_k, p.baseline.clip_k), (self.bl_iter, p.baseline.n_iter), (self.bl_window, p.baseline.window),
+            (self.th_mode, p.threshold.mode), (self.th_nsigma, p.threshold.n_sigma), (self.th_abs, p.threshold.abs_adc),
+            (self.f_kind, p.filt.kind), (self.f_low, p.filt.f_low), (self.f_high, p.filt.f_high), (self.f_order, p.filt.order),
+            (self.sm_method, p.smooth.method), (self.sm_window, p.smooth.window), (self.sm_poly, p.smooth.poly),
+            (self.dv_method, p.deriv.method), (self.dv_window, p.deriv.window), (self.dv_poly, p.deriv.poly), (self.dv_order, p.deriv.order),
+            (self.pk_source, p.peaks.source), (self.pk_distance, p.peaks.distance_ns), (self.pk_prom, p.peaks.prominence_sigma),
+            (self.pk_width, p.peaks.min_width_ns), (self.pk_gate_pre, p.peaks.gate_pre_ns), (self.pk_gate_post, p.peaks.gate_post_ns),
+            (self.fit_enabled, p.fit.enabled), (self.fit_model, p.fit.model), (self.fit_source, p.fit.source),
+            (self.fit_xmin, p.fit.x_min_ns), (self.fit_xmax, p.fit.x_max_ns),
+            (self.sp_window, p.spectrum.window), (self.sp_nperseg, p.spectrum.nperseg), (self.sp_logy, p.spectrum.log_y),
+        ]
+        for widget, value in pairs:
+            _set_silent(widget, value)
+        self._sync_enabled()
+        self.changed.emit()
