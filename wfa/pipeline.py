@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -96,15 +97,18 @@ def scan(source: WaveformSource, p: AnalysisParams, n_events: int,
          start: int = 0, progress=None) -> ScanResult:
     """遍历多个事件，汇总峰参数用于幅度谱/电荷谱统计。
 
+    批量峰统计不使用单事件波形拟合，因此会自动关闭 fit，避免 curve_fit 显著拖慢扫描。
     progress: 可选回调 ``progress(done, total) -> bool``，返回 False 则提前终止。
     """
     stop = min(source.n_events, start + max(0, n_events))
     amps, chgs, tms, npk, bases, sigs = [], [], [], [], [], []
     total = max(1, stop - start)
+    scan_params = deepcopy(p)
+    scan_params.fit.enabled = False
 
     for n, i in enumerate(range(start, stop)):
         t, y = source.get_event(i)
-        r = analyze(t, y, p)
+        r = analyze(t, y, scan_params)
         npk.append(len(r.peak_list))
         bases.append(float(np.mean(r.baseline)))
         sigs.append(r.sigma)
