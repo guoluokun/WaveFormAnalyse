@@ -9,6 +9,8 @@ import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
+from .. import config as cfg_io
+from .. import fitting as fit_mod
 from .. import io_root, peaks as pk_mod, pipeline
 from .controls import ControlPanel, NoWheelDoubleSpinBox, NoWheelComboBox, NoWheelSpinBox
 
@@ -23,6 +25,8 @@ PEN_DERIV = pg.mkPen("#7b3fa0", width=2)
 PEN_ZERO = pg.mkPen("#999999", width=1, style=QtCore.Qt.PenStyle.DotLine)
 PEN_SPEC = pg.mkPen("#1f77b4", width=2)
 PEN_PSD = pg.mkPen("#d62728", width=2)
+PEN_FIT = pg.mkPen("#d62728", width=3)
+PEN_RESID = pg.mkPen("#444444", width=2)
 BRUSH_HIST = pg.mkBrush(31, 119, 180, 120)
 
 
@@ -37,7 +41,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._source: io_root.WaveformSource | None = None
         self._result: pipeline.AnalysisResult | None = None
         self._scan: pipeline.ScanResult | None = None
-        self._auto_view = True      # 未手动缩放时，每次重绘都自动适配视图
+        self._auto_view = True
 
         self.controls = ControlPanel()
         self.controls.changed.connect(self.reanalyze)
@@ -57,7 +61,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._fit_shortcut.activated.connect(self.fit_view)
         self.statusBar().showMessage("请打开 ROOT 文件")
 
-    # ---------------------------------------------------------------- 界面搭建
     def _build_toolbar(self):
         bar = QtWidgets.QToolBar("主工具栏")
         bar.setMovable(False)
@@ -67,9 +70,17 @@ class MainWindow(QtWidgets.QMainWindow):
         open_btn.clicked.connect(self.open_file)
         bar.addWidget(open_btn)
 
+        save_cfg = QtWidgets.QPushButton("保存参数")
+        save_cfg.setToolTip("把当前分析参数保存为 JSON，便于复现实验和算法比较")
+        save_cfg.clicked.connect(self.save_config)
+        bar.addWidget(save_cfg)
+        load_cfg = QtWidgets.QPushButton("加载参数")
+        load_cfg.clicked.connect(self.load_config)
+        bar.addWidget(load_cfg)
+
         bar.addWidget(QtWidgets.QLabel("  数据源 "))
         self.source_box = NoWheelComboBox()
-        self.source_box.setMinimumWidth(420)
+        self.source_box.setMinimumWidth(360)
         self.source_box.currentIndexChanged.connect(self._on_source_changed)
         bar.addWidget(self.source_box)
 
@@ -90,35 +101,30 @@ class MainWindow(QtWidgets.QMainWindow):
         prev_btn = QtWidgets.QPushButton("← 上一事件")
         prev_btn.clicked.connect(lambda: self.event_spin.setValue(self.event_spin.value() - 1))
         bar.addWidget(prev_btn)
-
         self.event_spin = NoWheelSpinBox()
         self.event_spin.setRange(0, 0)
         self.event_spin.valueChanged.connect(self.reanalyze)
         bar.addWidget(self.event_spin)
-
         next_btn = QtWidgets.QPushButton("下一事件 →")
         next_btn.clicked.connect(lambda: self.event_spin.setValue(self.event_spin.value() + 1))
         bar.addWidget(next_btn)
-
         self.event_label = QtWidgets.QLabel("  / 0")
         bar.addWidget(self.event_label)
 
         bar.addSeparator()
         fit_btn = QtWidgets.QPushButton("适配视图")
-        fit_btn.setToolTip("把所有图恢复到完整显示数据的合适缩放（快捷键 R）")
+        fit_btn.setToolTip("恢复所有图的自动缩放（快捷键 R）")
         fit_btn.clicked.connect(self.fit_view)
         bar.addWidget(fit_btn)
 
     def _all_plots(self) -> list:
-        return [self.p_raw, self.p_sig, self.p_deriv,
+        return [self.p_raw, self.p_sig, self.p_deriv, self.p_fit, self.p_resid,
                 self.p_amp, self.p_psd, self.p_hamp, self.p_hchg]
 
     def _on_manual_range(self, *_):
-        """用户手动缩放/平移后停止自动适配，直到点「适配视图」。"""
         self._auto_view = False
 
     def fit_view(self):
-        """所有图恢复自动缩放并立即适配到数据范围。"""
         self._auto_view = True
         for plot in self._all_plots():
             vb = plot.getViewBox()
@@ -130,6 +136,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(self.tabs)
         self.tabs.addTab(self._build_wave_tab(), "波形")
         self.tabs.addTab(self._build_deriv_tab(), "导数")
+        self.tabs.addTab(self._build_fit_tab(), "拟合")
         self.tabs.addTab(self._build_spec_tab(), "频谱")
         self.tabs.addTab(self._build_peak_tab(), "峰列表")
         self.tabs.addTab(self._build_scan_tab(), "批量统计")
@@ -144,19 +151,14 @@ class MainWindow(QtWidgets.QMainWindow):
             p.setLabel("left", "幅度", units="ADC")
             p.addLegend(offset=(-10, 10))
         self.p_sig.setXLink(self.p_raw)
-
-        # 上视图：原始波形 + 基线 + 阈值（阈值换算回原始 ADC 刻度）
         self.c_raw = self.p_raw.plot([], [], pen=PEN_RAW, name="原始波形")
         self.c_base = self.p_raw.plot([], [], pen=PEN_BASELINE, name="基线")
         self.c_thr_raw = self.p_raw.plot([], [], pen=PEN_THR, name="阈值")
-        # 下视图：滤波与基线校正后的信号 + 过阈部分 + 峰
         self.c_sig = self.p_sig.plot([], [], pen=PEN_SIGNAL, name="处理后信号")
         self.c_gated = self.p_sig.plot([], [], pen=PEN_GATED, name="过阈部分")
         self.l_thr = pg.InfiniteLine(angle=0, pen=PEN_THR, movable=False)
         self.p_sig.addItem(self.l_thr)
-        self.s_peaks = pg.ScatterPlotItem(symbol="d", size=13,
-                                          brush=pg.mkBrush(214, 39, 40, 220),
-                                          pen=pg.mkPen("k", width=1))
+        self.s_peaks = pg.ScatterPlotItem(symbol="d", size=13, brush=pg.mkBrush(214, 39, 40, 220), pen=pg.mkPen("k", width=1))
         self.p_sig.addItem(self.s_peaks)
         return layout
 
@@ -169,11 +171,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.p_deriv.addLegend(offset=(-10, 10))
         self.c_deriv = self.p_deriv.plot([], [], pen=PEN_DERIV, name="导数")
         self.p_deriv.addItem(pg.InfiniteLine(pos=0, angle=0, pen=PEN_ZERO))
-        self.s_dpeaks = pg.ScatterPlotItem(symbol="t1", size=13,
-                                           brush=pg.mkBrush(255, 127, 14, 220),
-                                           pen=pg.mkPen("k", width=1))
+        self.s_dpeaks = pg.ScatterPlotItem(symbol="t1", size=13, brush=pg.mkBrush(255, 127, 14, 220), pen=pg.mkPen("k", width=1))
         self.p_deriv.addItem(self.s_dpeaks)
         return layout
+
+    def _build_fit_tab(self) -> QtWidgets.QWidget:
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        self.fit_info = QtWidgets.QLabel("拟合未启用")
+        self.fit_info.setWordWrap(True)
+        v.addWidget(self.fit_info)
+        layout = pg.GraphicsLayoutWidget()
+        self.p_fit = layout.addPlot(row=0, col=0, title="波形拟合")
+        self.p_resid = layout.addPlot(row=1, col=0, title="残差：data - fit")
+        for p in (self.p_fit, self.p_resid):
+            p.showGrid(x=True, y=True, alpha=0.3)
+            p.setLabel("bottom", "时间", units="ns")
+            p.setLabel("left", "幅度", units="ADC")
+        self.p_fit.addLegend(offset=(-10, 10))
+        self.p_fit.setXLink(self.p_resid)
+        self.c_fit_data = self.p_fit.plot([], [], pen=PEN_SIGNAL, name="拟合输入")
+        self.c_fit_model = self.p_fit.plot([], [], pen=PEN_FIT, name="拟合模型")
+        self.c_resid = self.p_resid.plot([], [], pen=PEN_RESID)
+        self.p_resid.addItem(pg.InfiniteLine(pos=0, angle=0, pen=PEN_ZERO))
+        v.addWidget(layout)
+        return w
 
     def _build_spec_tab(self) -> QtWidgets.QWidget:
         layout = pg.GraphicsLayoutWidget()
@@ -200,7 +222,6 @@ class MainWindow(QtWidgets.QMainWindow):
         btn.clicked.connect(self.export_peaks)
         top.addWidget(btn)
         v.addLayout(top)
-
         self.peak_table = QtWidgets.QTableWidget(0, len(pk_mod.COLUMNS))
         self.peak_table.setHorizontalHeaderLabels([c[1] for c in pk_mod.COLUMNS])
         self.peak_table.horizontalHeader().setStretchLastSection(True)
@@ -233,7 +254,6 @@ class MainWindow(QtWidgets.QMainWindow):
         top.addWidget(self.scan_info)
         top.addStretch(1)
         v.addLayout(top)
-
         layout = pg.GraphicsLayoutWidget()
         self.p_hamp = layout.addPlot(row=0, col=0, title="幅度谱（所有峰）")
         self.p_hchg = layout.addPlot(row=1, col=0, title="电荷谱（所有峰积分）")
@@ -245,27 +265,40 @@ class MainWindow(QtWidgets.QMainWindow):
         v.addWidget(layout)
         return w
 
-    # ---------------------------------------------------------------- 数据加载
-    def open_file(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "选择 ROOT 文件", "", "ROOT 文件 (*.root);;所有文件 (*)")
+    def save_config(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "保存分析参数", "analysis_config.json", "JSON (*.json)")
         if not path:
             return
-        self.load_path(path)
+        try:
+            cfg_io.save_json(path, self.controls.params())
+            self.statusBar().showMessage(f"已保存参数 {path}")
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "保存失败", str(exc))
+
+    def load_config(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "加载分析参数", "", "JSON (*.json);;所有文件 (*)")
+        if not path:
+            return
+        try:
+            self.controls.set_params(cfg_io.load_json(path))
+            self.statusBar().showMessage(f"已加载参数 {path}")
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "加载失败", str(exc))
+
+    def open_file(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "选择 ROOT 文件", "", "ROOT 文件 (*.root);;所有文件 (*)")
+        if path:
+            self.load_path(path)
 
     def load_path(self, path: str):
-        """加载 ROOT 文件并列出所有可用波形数据源。"""
         try:
             specs = io_root.discover_sources(path)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "打开失败", f"无法解析文件:\n{exc}")
             return
         if not specs:
-            QtWidgets.QMessageBox.warning(
-                self, "未找到波形",
-                "文件中没有识别到一维数值序列分支或 TH1 直方图。")
+            QtWidgets.QMessageBox.warning(self, "未找到波形", "文件中没有识别到一维数值序列分支或 TH1 直方图。")
             return
-
         self._path = path
         self._specs = specs
         self.source_box.blockSignals(True)
@@ -300,10 +333,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.event_spin.blockSignals(False)
         self.event_label.setText(f"  / {n - 1}")
         self.scan_n.setValue(min(1000, max(1, n)))
-        self._auto_view = True      # 换数据源后重新适配视图
+        self._auto_view = True
         self.reanalyze()
 
-    # ---------------------------------------------------------------- 分析绘图
     def reanalyze(self):
         if self._source is None:
             return
@@ -316,20 +348,18 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._plot_result(self._result)
         self._fill_peak_table(self._result)
-
         r = self._result
-        base_txt = f"{np.mean(r.baseline):.2f}"
+        fit_txt = ""
+        if r.fit is not None and params.fit.enabled:
+            fit_txt = f" | 拟合 {'OK' if r.fit.success else '失败'}"
         self.statusBar().showMessage(
             f"事件 {self.event_spin.value()} | 采样点 {r.raw.size} | dt = {r.dt_ns:.4g} ns | "
-            f"采样率 {1e3 / r.dt_ns:.4g} MHz | 基线 = {base_txt} ADC | "
-            f"sigma = {r.sigma:.3f} ADC | 阈值 = {r.threshold:.3f} ADC | "
-            f"峰数 = {len(r.peak_list)}"
+            f"采样率 {1e3 / r.dt_ns:.4g} MHz | 基线 = {np.mean(r.baseline):.2f} ADC | "
+            f"sigma = {r.sigma:.3f} ADC | 阈值 = {r.threshold:.3f} ADC | 峰数 = {len(r.peak_list)}{fit_txt}"
         )
 
     def _plot_result(self, r: pipeline.AnalysisResult):
         self.c_raw.setData(r.t, r.raw)
-        # 基线与阈值都是在滤波后的波形上算的；高通/带通去掉了直流，
-        # 这里补回 dc_offset 才能画在原始 ADC 刻度上，否则上视图会被拉伸
         base_raw = r.baseline + r.dc_offset
         self.c_base.setData(r.t, base_raw)
         self.c_thr_raw.setData(r.t, base_raw + r.polarity * r.threshold)
@@ -342,11 +372,7 @@ class MainWindow(QtWidgets.QMainWindow):
             xs = [p.time_ns for p in r.peak_list]
             ys = [p.amplitude for p in r.peak_list]
             self.s_peaks.setData(xs, ys)
-            # 导数图上的标记：过零点模式标在过零处，其余模式标在上升沿处
-            if self.controls.pk_source.currentData() == "zero_cross":
-                marks = np.asarray(xs, dtype=np.float64)
-            else:
-                marks = np.asarray([p.t_start_ns for p in r.peak_list], dtype=np.float64)
+            marks = np.asarray(xs if self.controls.pk_source.currentData() == "zero_cross" else [p.t_start_ns for p in r.peak_list], dtype=np.float64)
             sidx = np.clip(np.searchsorted(r.t, marks), 0, r.deriv.size - 1)
             self.s_dpeaks.setData(r.t[sidx], r.deriv[sidx])
         else:
@@ -354,28 +380,29 @@ class MainWindow(QtWidgets.QMainWindow):
             self.s_dpeaks.setData([], [])
 
         self.c_deriv.setData(r.t, r.deriv)
-        # 标题里写明当前求导方法与结果特征，切换方法时能直接看出差别
-        # （导数图纵轴自动缩放，只看曲线形状容易误以为没变化）
         order_txt = "二阶导数 d²V/dt²" if self.controls.dv_order.value() == 2 else "一阶导数 dV/dt"
-        self.p_deriv.setTitle(
-            f"{order_txt} · {self.controls.dv_method.currentText()}"
-            f"（平滑：{self.controls.sm_method.currentText()}）"
-            f" · 最大斜率 {r.deriv.max():.4g} · 噪声 RMS {np.std(r.deriv):.4g}"
-        )
-        self.p_sig.setTitle(
-            f"滤波（{self.controls.f_kind.currentText()}）+ 基线校正"
-            f"（{self.controls.bl_method.currentText()}）+ 极性归一后的信号"
-        )
+        self.p_deriv.setTitle(f"{order_txt} · {self.controls.dv_method.currentText()}（平滑：{self.controls.sm_method.currentText()}） · 最大值 {r.deriv.max():.4g} · RMS {np.std(r.deriv):.4g}")
+        self.p_sig.setTitle(f"滤波（{self.controls.f_kind.currentText()}）+ 基线校正（{self.controls.bl_method.currentText()}）+ 极性归一")
+
+        fit_input = r.smoothed if self.controls.fit_source.currentData() == "smoothed" else r.signal
+        self.c_fit_data.setData(r.t, fit_input)
+        if r.fit is not None and r.fit.success:
+            self.c_fit_model.setData(r.t, r.fit.y_fit, connect="finite")
+            self.c_resid.setData(r.t, r.fit.residual, connect="finite")
+            q = f"χ²/ndf={r.fit.reduced_chi2:.4g}" if np.isfinite(r.fit.reduced_chi2) else "χ²/ndf=N/A"
+            self.fit_info.setText(f"模型：{self.controls.fit_model.currentText()} | {fit_mod.format_parameters(r.fit)} | residual RMS={r.fit.rms:.4g} ADC | {q}")
+        else:
+            self.c_fit_model.setData([], [])
+            self.c_resid.setData([], [])
+            self.fit_info.setText("拟合未启用" if r.fit is None or r.fit.message == "拟合未启用" else f"拟合失败：{r.fit.message}")
 
         log_y = self.controls.sp_logy.isChecked()
         self.p_amp.setLogMode(False, log_y)
         self.p_psd.setLogMode(False, log_y)
         if r.freq_mhz.size:
-            # 去掉直流点，避免对数坐标下出现 -inf
             self.c_amp.setData(r.freq_mhz[1:], np.maximum(r.amp_spec[1:], 1e-12))
         if r.psd_freq_mhz.size:
             self.c_psd.setData(r.psd_freq_mhz[1:], np.maximum(r.psd_val[1:], 1e-30))
-
         if self._auto_view:
             self.fit_view()
 
@@ -386,12 +413,8 @@ class MainWindow(QtWidgets.QMainWindow):
             for j, val in enumerate(row):
                 self.peak_table.setItem(i, j, QtWidgets.QTableWidgetItem(val))
         total_charge = sum(p.area_adc_ns for p in r.peak_list)
-        self.peak_info.setText(
-            f"事件 {self.event_spin.value()}：{len(rows)} 个峰，"
-            f"总积分电荷 {total_charge:.4g} ADC·ns，阈值 {r.threshold:.3f} ADC"
-        )
+        self.peak_info.setText(f"事件 {self.event_spin.value()}：{len(rows)} 个峰，总积分电荷 {total_charge:.4g} ADC·ns，阈值 {r.threshold:.3f} ADC")
 
-    # ---------------------------------------------------------------- 批量扫描
     def run_scan(self):
         if self._source is None:
             return
@@ -424,10 +447,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hist_to(self.p_hchg, s.charges, bins)
         mean_pk = float(np.mean(s.n_peaks)) if s.n_peaks.size else 0.0
         mean_sig = float(np.mean(s.sigmas)) if s.sigmas.size else 0.0
-        self.scan_info.setText(
-            f"  已扫描 {s.n_events} 事件，共 {s.amplitudes.size} 个峰，"
-            f"平均 {mean_pk:.2f} 峰/事件，平均噪声 sigma {mean_sig:.3f} ADC"
-        )
+        self.scan_info.setText(f"  已扫描 {s.n_events} 事件，共 {s.amplitudes.size} 个峰，平均 {mean_pk:.2f} 峰/事件，平均噪声 sigma {mean_sig:.3f} ADC")
 
     @staticmethod
     def _hist_to(plot, data: np.ndarray, bins: int):
@@ -438,16 +458,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if hi <= lo:
             hi = lo + 1.0
         counts, edges = np.histogram(data, bins=bins, range=(lo, hi))
-        plot.plot(edges, counts, stepMode="center", fillLevel=0,
-                  brush=BRUSH_HIST, pen=PEN_SPEC)
+        plot.plot(edges, counts, stepMode="center", fillLevel=0, brush=BRUSH_HIST, pen=PEN_SPEC)
 
-    # ---------------------------------------------------------------- 导出
     def export_peaks(self):
         if self._result is None or not self._result.peak_list:
             QtWidgets.QMessageBox.information(self, "无数据", "当前事件没有找到峰。")
             return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "保存峰表", f"peaks_event{self.event_spin.value()}.csv", "CSV (*.csv)")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "保存峰表", f"peaks_event{self.event_spin.value()}.csv", "CSV (*.csv)")
         if not path:
             return
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
@@ -461,8 +478,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if s is None or s.amplitudes.size == 0:
             QtWidgets.QMessageBox.information(self, "无数据", "请先执行批量扫描。")
             return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "保存扫描结果", "scan_peaks.csv", "CSV (*.csv)")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "保存扫描结果", "scan_peaks.csv", "CSV (*.csv)")
         if not path:
             return
         with open(path, "w", newline="", encoding="utf-8-sig") as f:

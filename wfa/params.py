@@ -1,4 +1,4 @@
-"""分析参数定义。界面与批量脚本共用同一套参数对象。"""
+"""分析参数定义。界面、批量脚本与配置文件共用同一套参数对象。"""
 
 from __future__ import annotations
 
@@ -46,12 +46,22 @@ class DerivParams:
 
 @dataclass
 class PeakParams:
-    source: str = "signal"     # signal | derivative
+    source: str = "signal"     # signal | derivative | zero_cross
     distance_ns: float = 20.0
-    prominence_sigma: float = 5.0   # 以基线 sigma 为单位，0 表示不限制；过小会把长尾上的局部极大误判为峰
+    prominence_sigma: float = 5.0
     min_width_ns: float = 0.0
-    gate_pre_ns: float = 0.0   # 电荷积分门：峰前长度，0 = 自动寻找脉冲边界
-    gate_post_ns: float = 0.0  # 电荷积分门：峰后长度，0 = 自动寻找脉冲边界
+    gate_pre_ns: float = 0.0
+    gate_post_ns: float = 0.0
+
+
+@dataclass
+class FitParams:
+    enabled: bool = False
+    model: str = "gaussian"    # gaussian | exponential | double_exp
+    source: str = "signal"     # signal | smoothed
+    x_min_ns: float = 0.0       # x_min == x_max == 0 表示自动使用完整时间范围
+    x_max_ns: float = 0.0
+    maxfev: int = 20000
 
 
 @dataclass
@@ -63,11 +73,12 @@ class SpectrumParams:
 
 @dataclass
 class AnalysisParams:
-    polarity: int = 1          # +1 正脉冲，-1 负脉冲
+    polarity: int = 1
     baseline: BaselineParams = field(default_factory=BaselineParams)
     threshold: ThresholdParams = field(default_factory=ThresholdParams)
     filt: FilterParams = field(default_factory=FilterParams)
     smooth: SmoothParams = field(default_factory=SmoothParams)
     deriv: DerivParams = field(default_factory=DerivParams)
     peaks: PeakParams = field(default_factory=PeakParams)
+    fit: FitParams = field(default_factory=FitParams)
     spectrum: SpectrumParams = field(default_factory=SpectrumParams)
