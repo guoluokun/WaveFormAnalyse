@@ -33,26 +33,28 @@ class FitResult:
 
 
 def gaussian(x, amplitude, center, sigma):
-    sigma = np.maximum(np.abs(sigma), 1e-12)
-    return amplitude * np.exp(-0.5 * ((x - center) / sigma) ** 2)
+    sigma = max(abs(float(sigma)), 1e-12)
+    return amplitude * np.exp(-0.5 * ((np.asarray(x) - center) / sigma) ** 2)
 
 
 def exponential(x, amplitude, t0, tau):
-    tau = np.maximum(np.abs(tau), 1e-12)
+    tau = max(abs(float(tau)), 1e-12)
+    x = np.asarray(x, dtype=np.float64)
     z = np.maximum(x - t0, 0.0)
     return np.where(x >= t0, amplitude * np.exp(-z / tau), 0.0)
 
 
 def double_exponential(x, amplitude, t0, tau_rise, tau_decay):
-    """常见快上升慢衰减脉冲：A*(exp(-t/t_decay)-exp(-t/t_rise))，峰值归一到 A。"""
-    tr = np.maximum(np.abs(tau_rise), 1e-12)
-    td = np.maximum(np.abs(tau_decay), tr + 1e-12)
+    """快上升慢衰减脉冲，amplitude 定义为模型峰值，与传入 x 范围无关。"""
+    tr = max(abs(float(tau_rise)), 1e-12)
+    td = max(abs(float(tau_decay)), tr * (1.0 + 1e-9))
+    x = np.asarray(x, dtype=np.float64)
     z = np.maximum(x - t0, 0.0)
     shape = np.where(x >= t0, np.exp(-z / td) - np.exp(-z / tr), 0.0)
-    peak = np.max(shape) if np.size(shape) else 0.0
-    if peak <= 0:
-        return np.zeros_like(np.asarray(x, dtype=np.float64))
-    return amplitude * shape / peak
+    # 解析峰位，避免用当前 x 数组的最大值归一而导致拟合区间改变模型定义。
+    z_peak = tr * td / (td - tr) * np.log(td / tr)
+    peak = np.exp(-z_peak / td) - np.exp(-z_peak / tr)
+    return amplitude * shape / max(float(peak), 1e-12)
 
 
 def _fit_window(t: np.ndarray, y: np.ndarray, p: FitParams):
@@ -84,7 +86,7 @@ def _initial_guess(model: str, x: np.ndarray, y: np.ndarray):
 
 
 def fit_waveform(t: np.ndarray, y: np.ndarray, p: FitParams, sigma: float = 0.0) -> FitResult:
-    """拟合一条波形并返回全长拟合曲线、残差和基本质量指标。"""
+    """拟合一条波形并返回拟合曲线、残差和基本质量指标。"""
     t = np.asarray(t, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
     if not p.enabled:
