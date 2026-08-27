@@ -1,0 +1,6 @@
+numpy>=1.24
+scipy>=1.10
+uproot>=5.3
+awkward>=2.6
+pyqtgraph>=0.13.4
+PyQt5>=5.15
