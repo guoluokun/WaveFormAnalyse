@@ -4,18 +4,11 @@ from __future__ import annotations
 
 import sys
 
-from pyqtgraph.Qt import QtWidgets
-
-from .ui import MainWindow
-
 
 def main() -> int:
-    app = QtWidgets.QApplication(sys.argv)
-    win = MainWindow()
-    win.show()
-    if len(sys.argv) > 1:
-        win.load_path(sys.argv[1])
-    return app.exec() if hasattr(app, "exec") else app.exec_()
+    # 复用顶层 main.py 的参数解析和 Qt 环境诊断，保证两种启动方式行为一致。
+    from main import main as app_main
+    return app_main()
 
 
 if __name__ == "__main__":
