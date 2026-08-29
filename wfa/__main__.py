@@ -4,18 +4,7 @@ from __future__ import annotations
 
 import sys
 
-from pyqtgraph.Qt import QtWidgets
-
-from .ui import MainWindow
-
-
-def main() -> int:
-    app = QtWidgets.QApplication(sys.argv)
-    win = MainWindow()
-    win.show()
-    if len(sys.argv) > 1:
-        win.load_path(sys.argv[1])
-    return app.exec() if hasattr(app, "exec") else app.exec_()
+from .app import main
 
 
 if __name__ == "__main__":
